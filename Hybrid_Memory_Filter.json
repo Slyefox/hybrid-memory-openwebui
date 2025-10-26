@@ -1,0 +1,319 @@
+"""
+title: Hybrid Memory Filter
+author: Slye Fox
+version: 1.0.0
+license: AGPL-3.0
+
+Automatic memory storage and retrieval filter for OpenWebUI.
+Works in conjunction with Hybrid Memory Tools.
+
+First open release:
+- Added smart tool detection to prevent duplicate memory injection
+- Skips injection ONLY when actively processing tool results (not past tool calls)
+- Detects internal OpenWebUI tasks and skips injection
+- Updated inlet() signature for OpenWebUI 0.6.32+ compatibility
+- More precise: only checks last message, not message history
+"""
+
+import sys
+import datetime
+import re
+from typing import Optional, Callable, Any, Awaitable, List, Dict
+import logging
+import json
+
+from open_webui.models.memories import Memories
+from open_webui.models.users import Users
+from pydantic import BaseModel, Field
+from open_webui.routers.memories import (
+    add_memory,
+    AddMemoryForm,
+    query_memory,
+    QueryMemoryForm,
+)
+from fastapi.requests import Request
+import open_webui.main
+
+# Set up logging
+LOGGER = logging.getLogger("FILTER:HYBRID_MEMORY")
+LOGGER.setLevel(logging.INFO)
+
+
+class Filter:
+    class Valves(BaseModel):
+        priority: int = Field(default=5, description="Filter execution priority.")
+        max_memories: int = Field(
+            default=3, description="Maximum number of memories to inject per request."
+        )
+        memory_length_cutoff: int = Field(
+            default=200, description="Maximum characters per memory in context."
+        )
+        memories_dist_max: float = Field(
+            default=0.7, description="Maximum distance threshold for memory relevance."
+        )
+        min_memory_length: int = Field(
+            default=10, description="Minimum message length to store as memory."
+        )
+        enabled: bool = Field(
+            default=True, description="Enable automatic memory operations."
+        )
+        skip_on_tool_processing: bool = Field(
+            default=True,
+            description="Skip memory injection when actively processing tool results to prevent duplication."
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    def _detect_active_memory_tool_processing(
+        self, 
+        messages: List[Dict]
+    ) -> bool:
+        """
+        Detect if we're actively processing a MEMORY tool result RIGHT NOW.
+        
+        Only checks the very last message - if it's a tool response from
+        the hybrid memory tool specifically, we're processing memory results
+        and should skip injection to avoid duplication.
+        
+        Returns True only if the last message is a hybrid memory tool response.
+        """
+        if not messages or len(messages) == 0:
+            return False
+        
+        # Only check the absolute last message
+        last_message = messages[-1]
+        
+        # If the last message is a tool response
+        if last_message.get("role") == "tool":
+            # Check if it's specifically from the hybrid memory tool
+            # The hybrid memory tool includes "source": "hybrid_dynamic_memory" in all responses
+            content = last_message.get("content", "")
+            
+            # Try to parse as JSON to check for memory tool signature
+            try:
+                if isinstance(content, str):
+                    parsed = json.loads(content)
+                    if parsed.get("source") == "hybrid_dynamic_memory":
+                        LOGGER.debug("Currently processing hybrid memory tool results - skipping filter injection")
+                        return True
+            except (json.JSONDecodeError, ValueError):
+                # Not JSON or not parseable, not a memory tool response
+                pass
+        
+        return False
+
+    async def inlet(
+        self,
+        body: dict,
+        __event_emitter__: Callable[[Any], Awaitable[None]],
+        __user__: Optional[dict] = None,
+        __task__: Optional[str] = None,
+        __tools__: Optional[List] = None,
+    ) -> dict:
+        """Inject relevant memories before processing request."""
+
+        # Check if filter is enabled in valves
+        if not self.valves.enabled:
+            return body
+
+        if not __user__:
+            return body
+
+        # NEW: Skip injection if this is an internal OpenWebUI task
+        # (like title generation, tag generation, follow-up generation, etc.)
+        if __task__ is not None:
+            LOGGER.debug(f"Skipping memory injection for internal task: {__task__}")
+            return body
+
+        try:
+            user = Users.get_user_by_id(__user__["id"])
+            messages = body.get("messages", [])
+
+            if not messages or not user:
+                return body
+
+            # NEW: Check if we're actively processing MEMORY tool results RIGHT NOW
+            if self.valves.skip_on_tool_processing:
+                if self._detect_active_memory_tool_processing(messages):
+                    LOGGER.debug("Skipping memory injection - currently processing memory tool results")
+                    # Still emit status so user knows filter is active
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "Processing memory tool results - filter standby.",
+                                "done": True
+                            },
+                        }
+                    )
+                    return body
+
+            # Build simple query from recent messages
+            query = self._build_memory_query(messages)
+
+            # Query memories
+            memories = await self._query_memories(query, user)
+
+            if memories:
+                # Format and inject memories
+                context = self._format_memory_context(memories)
+
+                # Find last user message
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("role") == "user":
+                        # Insert memory context before user message
+                        messages.insert(i, {"role": "system", "content": context})
+                        break
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {"description": "Memory search completed.", "done": True},
+                }
+            )
+
+        except Exception as e:
+            LOGGER.error(f"Error in inlet: {e}")
+
+        return body
+
+    async def outlet(
+        self,
+        body: dict,
+        __event_emitter__: Callable[[Any], Awaitable[None]],
+        __user__: Optional[dict] = None,
+    ) -> dict:
+        """Store important messages after response."""
+
+        # Check if filter is enabled in valves
+        if not self.valves.enabled:
+            return body
+
+        if not __user__:
+            return body
+
+        try:
+            user = Users.get_user_by_id(__user__["id"])
+            messages = body.get("messages", [])
+
+            if not messages or not user:
+                return body
+
+            # Check last user message
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    # Strip HTML/XML tags before storing
+                    clean_content = re.sub(r'<[^>]+>', '', content).strip()
+                    if self._should_store_message(clean_content):
+                        await add_memory(
+                            request=Request(
+                                scope={"type": "http", "app": open_webui.main.app}
+                            ),
+                            form_data=AddMemoryForm(content=f"User: {clean_content}"),
+                            user=user,
+                        )
+                    break
+
+            # Check last assistant message
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    # Strip HTML/XML tags before storing
+                    clean_content = re.sub(r'<[^>]+>', '', content).strip()
+                    if len(clean_content) > 50 and not clean_content.startswith("I don't"):
+                        await add_memory(
+                            request=Request(
+                                scope={"type": "http", "app": open_webui.main.app}
+                            ),
+                            form_data=AddMemoryForm(
+                                content=f"Assistant: {clean_content[:5000]}"
+                            ),
+                            user=user,
+                        )
+                    break
+
+        except Exception as e:
+            LOGGER.error(f"Error in outlet: {e}")
+
+        return body
+
+    def _build_memory_query(self, messages: List[Dict]) -> str:
+        """Build query from recent messages."""
+        recent = messages[-3:] if len(messages) > 3 else messages
+        user_content = []
+
+        for msg in recent:
+            if msg.get("role") == "user" and msg.get("content"):
+                user_content.append(msg["content"].strip())
+
+        return user_content[-1][:100] if user_content else "general conversation"
+
+    async def _query_memories(self, query: str, user) -> List[Dict]:
+        """Query relevant memories."""
+        try:
+            memories = await query_memory(
+                request=Request(scope={"type": "http", "app": open_webui.main.app}),
+                form_data=QueryMemoryForm(content=query, k=self.valves.max_memories),
+                user=user,
+            )
+
+            filtered = []
+            for memory in memories:
+                if (
+                    hasattr(memory, "distance")
+                    and memory.distance <= self.valves.memories_dist_max
+                ):
+                    filtered.append(
+                        {"content": memory.content, "distance": memory.distance}
+                    )
+
+            return filtered
+        except Exception:
+            return []
+
+    def _format_memory_context(self, memories: List[Dict]) -> str:
+        """Format memories for context injection."""
+        if not memories:
+            return ""
+
+        items = []
+        for memory in memories[: self.valves.max_memories]:
+            content = memory.get("content", "")
+            if len(content) > self.valves.memory_length_cutoff:
+                content = content[: self.valves.memory_length_cutoff] + "..."
+            items.append(f"- {content}")
+
+        # Make it clear these are dynamic memories from hybrid, not JSON files
+        return f"<recent_memories_from_hybrid>\n{chr(10).join(items)}\n</recent_memories_from_hybrid>"
+
+    def _should_store_message(self, content: str) -> bool:
+        """Determine if message should be stored."""
+        # Strip HTML/XML tags before evaluation
+        clean_content = re.sub(r'<[^>]+>', '', content).strip()
+        
+        if len(clean_content) < self.valves.min_memory_length:
+            return False
+
+        # Important patterns
+        important_patterns = [
+            r"\b(like|dislike|prefer|hate|love)\b",
+            r"\b(plan|planning|will|going to)\b",
+            r"\b(remember|important|need|want)\b",
+            r"\b(name is|called|my)\b",
+            r"\b(work|job|study|learn)\b",
+        ]
+
+        content_lower = clean_content.lower()
+        for pattern in important_patterns:
+            if re.search(pattern, content_lower):
+                return True
+
+        # Skip generic responses
+        if re.match(
+            r"^(ok|okay|yes|no|thanks|hi|hello|bye)\.?$", content_lower.strip()
+        ):
+            return False
+
+        return len(clean_content) > 20
