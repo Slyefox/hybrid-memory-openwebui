@@ -37,6 +37,9 @@
 
 - **HYBRID_MEMORY_FILTER.json** (12KB)
   - Companion filter (optional but recommended)
+
+- **HYBRID_MEMORY_FILTER_README.md** (8KB)
+  - Companion filter ReadME (optional but recommended)
 ---
 
 ## Download Links for Community
@@ -52,7 +55,8 @@
 7. LICENSE.md
 **Optional:**
 8. HYBRID_MEMORY_FILTER.json - Companion filter (optional but recommended)
-**Total:** 8 files, ~216KB
+9. HYBRID_MEMORY_FILTER_README.md
+**Total:** 9 files, ~224KB
 
 ---
 
