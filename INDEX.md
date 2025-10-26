@@ -34,19 +34,25 @@
 
 - **LICENSE.md** (37KB)
   - Contains AGPL-3.0 license
+
+- **HYBRID_MEMORY_FILTER.json** (12KB)
+  - Companion filter (optional but recommended)
 ---
 
 ## Download Links for Community
 
 **Required:**
-1. Hybrid_Memory_XL.json
-2. HYBRID_MEMORY_XL_README.md
-3. QUICK_START.md
-4. INDEX.md
-5. TROUBLESHOOTING.md
-6. SYSTEM_PROMPT.md
-7. LICENSE.md
-**Total:** 7 files, ~204KB
+1. HYBRID_MEMORY_XL.json
+ - Main tool (required)
+3. HYBRID_MEMORY_XL_README.md
+4. QUICK_START.md
+5. INDEX.md
+6. TROUBLESHOOTING.md
+7. SYSTEM_PROMPT.md
+8. LICENSE.md
+**Optional:**
+9. HYBRID_MEMORY_FILTER.json - Companion filter (optional but recommended)
+**Total:** 9 files, ~216KB
 
 ---
 
