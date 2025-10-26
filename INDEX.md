@@ -44,15 +44,15 @@
 **Required:**
 1. HYBRID_MEMORY_XL.json
  - Main tool (required)
-3. HYBRID_MEMORY_XL_README.md
-4. QUICK_START.md
-5. INDEX.md
-6. TROUBLESHOOTING.md
-7. SYSTEM_PROMPT.md
-8. LICENSE.md
+2. HYBRID_MEMORY_XL_README.md
+3. QUICK_START.md
+4. INDEX.md
+5. TROUBLESHOOTING.md
+6. SYSTEM_PROMPT.md
+7. LICENSE.md
 **Optional:**
-9. HYBRID_MEMORY_FILTER.json - Companion filter (optional but recommended)
-**Total:** 9 files, ~216KB
+8. HYBRID_MEMORY_FILTER.json - Companion filter (optional but recommended)
+**Total:** 8 files, ~216KB
 
 ---
 
