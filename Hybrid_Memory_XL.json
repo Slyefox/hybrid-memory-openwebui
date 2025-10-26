@@ -1,0 +1,2858 @@
+"""
+title: Hybrid Memory XL
+author: Slye Fox
+version: 1.0.0
+license: AGPL-3.0
+
+Copyright (C) 2025 Slye Fox
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+This tool is an improved version of https://github.com/CookSleep
+and https://github.com/wawawario2 and combines the best features
+of the openwebui tool and the TextGen LTM Script.
+Optimized for local models.
+
+Key improvements:
+- Memory length limiting to prevent context overflow
+- Better relevance filtering
+- Simplified memory assessment
+- Controlled context injection
+- Fixed datetime handling bug
+- Clear distinction between dynamic memories and JSON knowledge files
+- Added delete memory functionality
+"""
+
+import sys
+import datetime
+import re
+from typing import Optional, Callable, Any, Awaitable, List, Dict, Union, Tuple
+import functools
+import inspect
+import asyncio
+import json
+import logging
+
+from open_webui.models.memories import Memories
+from pydantic import BaseModel, Field
+
+import aiohttp
+from fastapi.requests import Request
+
+import open_webui
+import open_webui.main
+from open_webui.routers.memories import (
+    add_memory,
+    AddMemoryForm,
+    query_memory,
+    QueryMemoryForm,
+    delete_memory_by_id,
+)
+from open_webui.models.users import Users, User
+from open_webui.env import GLOBAL_LOG_LEVEL
+
+LOGGER: logging.Logger = logging.getLogger("FUNC:HYBRID_MEMORY")
+
+
+def set_logs(logger: logging.Logger, level: int, force: bool = False):
+    """Configure logger with appropriate handlers."""
+    logger.setLevel(level)
+
+    if not force and any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        return logger
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(level)
+    formatter = logging.Formatter(
+        "%(levelname)s[%(name)s]%(lineno)s:%(asctime)s: %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+
+set_logs(LOGGER, GLOBAL_LOG_LEVEL)
+
+
+def log_exceptions(func: Callable[..., Any]):
+    """Decorator to log exceptions in functions."""
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                LOGGER.error("Error in %s: %s", func, exc, exc_info=True)
+                raise exc
+
+    else:
+
+        @functools.wraps(func)
+        def _wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                LOGGER.error("Error in %s: %s", func, exc, exc_info=True)
+                raise exc
+
+    return _wrapper
+
+
+class ROLE:
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+def get_api_chat_completion_config() -> tuple[str, str]:
+    """Get chat completion API config from OpenWebUI."""
+    config = open_webui.main.app.state.config
+    if config.ENABLE_OLLAMA_API and config.OLLAMA_BASE_URLS:
+        key = ""
+        base_url = config.OLLAMA_BASE_URLS[0]
+        if config.OLLAMA_API_CONFIGS.get(base_url):
+            key = config.OLLAMA_API_CONFIGS[base_url].get("key") or ""
+        return (base_url, key)
+    elif config.ENABLE_OPENAI_API and config.OPENAI_API_BASE_URLS:
+        base_url = config.OPENAI_API_BASE_URLS[0]
+        return (base_url, config.OPENAI_API_KEYS[base_url].get("key"))
+    else:
+        return ("http://localhost:11434", "")
+
+
+async def single_query_model(
+    session: aiohttp.ClientSession,
+    target_url: str,
+    model: str,
+    system: str,
+    query: str,
+    *,
+    api_key: Optional[str] = None,
+) -> str:
+    """Send a single query to the model and return the answer."""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": ROLE.SYSTEM, "content": system},
+            {"role": ROLE.USER, "content": query},
+        ],
+    }
+
+    try:
+        resp = await session.post(
+            target_url,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            json=payload,
+        )
+        assert resp.status == 200, resp
+        resp_json = await resp.json()
+        assert resp_json.get("object") == "chat.completion", "Unexpected answer format."
+
+        output = resp_json["choices"][0]["message"]["content"].strip()
+        return output
+    except Exception as exc:
+        LOGGER.error("Query to %s failed with: %s", target_url, exc)
+        raise exc
+
+
+def get_last_message(
+    messages: List[Dict[str, str]], role: str
+) -> Tuple[Optional[Dict[str, str]], Optional[int]]:
+    """Get last message from role and its index."""
+    for i, m in enumerate(reversed(messages)):
+        if m.get("role") == role:
+            return (m, len(messages) - i - 1)
+    return (None, None)
+
+
+def safe_datetime_format(dt_value) -> Optional[str]:
+    """Safely format datetime values, handling various input types."""
+    if dt_value is None:
+        return None
+
+    try:
+        # If it's already a datetime object
+        if hasattr(dt_value, "isoformat"):
+            return dt_value.isoformat()
+
+        # If it's a timestamp (int or float)
+        if isinstance(dt_value, (int, float)):
+            return datetime.datetime.fromtimestamp(dt_value).isoformat()
+
+        # If it's a string, try to parse it
+        if isinstance(dt_value, str):
+            # Try common formats
+            formats = [
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d",
+            ]
+            for fmt in formats:
+                try:
+                    parsed_dt = datetime.datetime.strptime(dt_value, fmt)
+                    return parsed_dt.isoformat()
+                except ValueError:
+                    continue
+
+            # If no format matches, return the string as-is
+            return str(dt_value)
+
+        # For any other type, convert to string
+        return str(dt_value)
+
+    except Exception as exc:
+        LOGGER.warning(f"Could not format datetime value {dt_value}: {exc}")
+        return str(dt_value) if dt_value is not None else None
+
+
+class EventEmitter:
+    def __init__(self, event_emitter: Callable[[dict], Any] = None):
+        self.event_emitter = event_emitter
+
+    async def emit(self, description="Unknown state", status="in_progress", done=False):
+        """Send a status event to the event emitter."""
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": status,
+                        "description": description,
+                        "done": done,
+                    },
+                }
+            )
+
+
+class Filter:
+    class Valves(BaseModel):
+        model: str = Field(
+            default="sentence-transformers/all-MiniLM-L6-v2",
+            description="Model to use to process memories.",
+        )
+
+        max_memories: int = Field(
+            default=3,
+            description="Maximum number of memories to load (reduced for smaller models).",
+        )
+
+        memory_length_cutoff: int = Field(
+            default=200,
+            description="Maximum characters per memory (prevents context overflow).",
+        )
+
+        memories_dist_max: float = Field(
+            default=0.7,
+            description="Ignore memories with distance higher than this (more selective).",
+        )
+
+        min_memory_length: int = Field(
+            default=10, description="Minimum message length to store as memory."
+        )
+
+        chat_api_host: str = Field(
+            default_factory=lambda: get_api_chat_completion_config()[0],
+            description="API host for model queries.",
+        )
+
+        api_key: str = Field(
+            default_factory=lambda: get_api_chat_completion_config()[1],
+            description="API key for model queries.",
+        )
+
+        priority: int = Field(default=5, description="Function execution priority.")
+
+    class UserValves(BaseModel):
+        enabled: bool = Field(
+            default=True, description="Enable or disable the memory function."
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.uservalves = self.UserValves()
+        self._session = aiohttp.ClientSession()
+
+    @log_exceptions
+    def __del__(self):
+        if hasattr(self, "_session"):
+            asyncio.run(self._session.close())
+
+    async def single_query_model(self, model: str, system: str, query: str) -> str:
+        target_url = f"{self.valves.chat_api_host.strip('/')}/v1/chat/completions"
+        return await single_query_model(
+            self._session, target_url, model, system, query, api_key=self.valves.api_key
+        )
+
+    def _build_simple_memory_query(self, messages: List[Dict[str, str]]) -> str:
+        """Build a simple memory query from recent messages."""
+        # Get the last few messages for context
+        recent_messages = messages[-3:] if len(messages) > 3 else messages
+
+        # Extract key terms from user messages
+        user_content = []
+        for msg in recent_messages:
+            if msg.get("role") == "user" and msg.get("content"):
+                content = msg["content"].strip()
+                if content:
+                    user_content.append(content)
+
+        # Simple keyword extraction - just use the last user message
+        if user_content:
+            return user_content[-1][:100]  # Limit to 100 chars
+
+        return "general conversation"
+
+    def _format_limited_context(self, memories: List[Dict[str, str]]) -> str:
+        """Format memory context with strict length limits."""
+        if not memories:
+            return ""
+
+        # Limit each memory and format simply
+        memory_items = []
+        for memory in memories[: self.valves.max_memories]:  # Strict limit
+            content = memory.get("content", "")
+            if len(content) > self.valves.memory_length_cutoff:
+                content = content[: self.valves.memory_length_cutoff] + "..."
+
+            memory_items.append(f"- {content}")
+
+        # Make it clear these are dynamic memories from hybrid, not JSON files
+        context = f"<recent_memories_from_hybrid>\n{chr(10).join(memory_items)}\n</recent_memories_from_hybrid>"
+        return context
+
+    async def _query_memories_simple(
+        self, query: str, user: User, max_distance: float = None
+    ) -> List[Dict[str, str]]:
+        """Query memories with simple filtering."""
+        if max_distance is None:
+            max_distance = self.valves.memories_dist_max
+
+        try:
+            # Use OpenWebUI's built-in memory query
+            memories = await query_memory(
+                request=Request(scope={"type": "http", "app": open_webui.main.app}),
+                form_data=QueryMemoryForm(content=query, k=self.valves.max_memories),
+                user=user,
+            )
+
+            # Filter by distance and return simplified format
+            filtered_memories = []
+            for memory in memories:
+                # Skip story chapters in automatic context injection
+                if memory.content.startswith("STORY_CHAPTER:"):
+                    continue
+
+                if hasattr(memory, "distance") and memory.distance <= max_distance:
+                    filtered_memories.append(
+                        {
+                            "id": memory.id,
+                            "content": memory.content,
+                            "distance": memory.distance,
+                        }
+                    )
+
+            return filtered_memories
+
+        except Exception as exc:
+            LOGGER.error(f"Error querying memories: {exc}")
+            return []
+
+    async def _simple_memory_assessment(self, content: str) -> bool:
+        """Simple heuristic-based memory assessment without LLM calls."""
+        # Strip HTML/XML tags before assessment
+        clean_content = re.sub(r"<[^>]+>", "", content).strip()
+
+        if len(clean_content) < self.valves.min_memory_length:
+            return False
+
+        # Simple heuristics for important content
+        important_patterns = [
+            r"\b(like|dislike|prefer|hate|love)\b",
+            r"\b(plan|planning|will|going to)\b",
+            r"\b(remember|important|need|want)\b",
+            r"\b(name is|called|my)\b",
+            r"\b(work|job|study|learn)\b",
+            r"\b(birthday|anniversary|date)\b",
+        ]
+
+        content_lower = clean_content.lower()
+        for pattern in important_patterns:
+            if re.search(pattern, content_lower):
+                return True
+
+        # Skip very short or generic responses
+        generic_patterns = [
+            r"^(ok|okay|yes|no|thanks|thank you)\.?$",
+            r"^(hi|hello|hey)\.?$",
+            r"^(goodbye|bye)\.?$",
+        ]
+
+        for pattern in generic_patterns:
+            if re.match(pattern, content_lower.strip()):
+                return False
+
+        return len(clean_content) > 20  # Basic length threshold
+
+    @log_exceptions
+    async def inlet(
+        self,
+        body: dict,
+        __event_emitter__: Callable[[Any], Awaitable[None]],
+        __user__: Optional[dict] = None,
+    ) -> dict:
+        """Pre-process request to inject relevant memories."""
+        if __user__ is None or not __user__.get("valves", {}).get("enabled", True):
+            return body
+
+        user = Users.get_user_by_id(__user__["id"])
+        messages = body.get("messages")
+        if not messages or not user:
+            return body
+
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {"description": "Searching memories...", "done": False},
+            }
+        )
+
+        # Simple memory query building
+        memory_query = self._build_simple_memory_query(messages)
+        LOGGER.debug("Memory query: %s", memory_query)
+
+        # Query relevant memories
+        memories = await self._query_memories_simple(memory_query, user)
+
+        if memories:
+            LOGGER.debug("Found %d relevant memories", len(memories))
+
+            # Format context with strict limits
+            context = self._format_limited_context(memories)
+
+            # Insert context before last user message
+            _, user_msg_index = get_last_message(messages, ROLE.USER)
+            if user_msg_index is not None and context:
+                context_message = {"role": ROLE.SYSTEM, "content": context}
+                messages.insert(user_msg_index, context_message)
+                LOGGER.debug("Injected memory context")
+
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {"description": "Memory search completed.", "done": True},
+            }
+        )
+
+        return body
+
+    @log_exceptions
+    async def outlet(
+        self,
+        body: dict,
+        __event_emitter__: Callable[[Any], Awaitable[None]],
+        __user__: Optional[dict] = None,
+    ) -> dict:
+        """Post-process response to store new memories."""
+        if __user__ is None or not __user__.get("valves", {}).get("enabled", True):
+            return body
+
+        user = Users.get_user_by_id(__user__["id"])
+        messages = body.get("messages")
+        if not messages or not user:
+            return body
+
+        # Store user message if worth remembering
+        user_message, _ = get_last_message(messages, ROLE.USER)
+        if user_message:
+            content = user_message.get("content", "")
+            # Strip HTML/XML tags before storing
+            clean_content = re.sub(r"<[^>]+>", "", content).strip()
+            if await self._simple_memory_assessment(clean_content):
+                try:
+                    await add_memory(
+                        request=Request(
+                            scope={"type": "http", "app": open_webui.main.app}
+                        ),
+                        form_data=AddMemoryForm(content=f"User: {clean_content}"),
+                        user=user,
+                    )
+                    LOGGER.debug("Stored user memory: %s", clean_content[:50])
+                except Exception as exc:
+                    LOGGER.error(f"Failed to store user memory: {exc}")
+
+        # Store assistant message if substantial
+        assistant_message, _ = get_last_message(messages, ROLE.ASSISTANT)
+        if assistant_message:
+            content = assistant_message.get("content", "")
+            # Strip HTML/XML tags before storing
+            clean_content = re.sub(r"<[^>]+>", "", content).strip()
+            # Only store longer, substantial assistant responses
+            if len(clean_content) > 50 and not clean_content.startswith("I don't"):
+                try:
+                    await add_memory(
+                        request=Request(
+                            scope={"type": "http", "app": open_webui.main.app}
+                        ),
+                        form_data=AddMemoryForm(
+                            content=f"Assistant: {clean_content[:200]}"
+                        ),
+                        user=user,
+                    )
+                    LOGGER.debug("Stored assistant memory: %s", clean_content[:50])
+                except Exception as exc:
+                    LOGGER.error(f"Failed to store assistant memory: {exc}")
+
+        return body
+
+
+class Tools:
+    """
+    Dynamic Memory Management Tool (hybrid_memory)
+
+    This tool manages your working memory for recent interactions.
+    It works alongside historical JSON memories to provide complete recall.
+
+    Use this tool when:
+    - You need to recall something not in the current context
+    - The user asks about recent conversations or preferences
+    - You want to store something important the user just said
+    - You need to delete incorrect or outdated memories
+
+    DO NOT cite outputs from this tool as JSON files.
+    These are YOUR memories, not external documents.
+    """
+
+    class Valves(BaseModel):
+        USE_MEMORY: bool = Field(default=True, description="Enable memory usage.")
+        DEBUG: bool = Field(default=False, description="Enable debug logging.")
+        max_memories: int = Field(
+            default=5,
+            description="Maximum number of memories to return in tool queries.",
+        )
+        memory_length_cutoff: int = Field(
+            default=200, description="Maximum characters per memory in tool results."
+        )
+        memories_dist_max: float = Field(
+            default=0.75, description="Maximum relevance distance for tool queries."
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    def __getattr__(self, name):
+        """
+        Catch calls to non-existent tool functions.
+        This runs when the AI calls a function that doesn't exist.
+        """
+
+        async def error_handler(*args, **kwargs):
+            # Check if it's a close match to suggest the right function
+            suggestion = None
+            if "consolidate" in name.lower() and "cluster" in name.lower():
+                suggestion = "consolidate_memories"
+            elif "duplicate" in name.lower():
+                suggestion = "deduplicate_memories"
+            elif "health" in name.lower():
+                suggestion = "memory_health_check"
+
+            return json.dumps(
+                {
+                    "error": f"Function '{name}' does not exist",
+                    "available_functions": [
+                        "get_relevant_memories",
+                        "analyze_memory_patterns",
+                        "consolidate_memories",
+                        "export_memories",
+                        "search_memories_with_context",
+                        "deduplicate_memories",
+                        "memory_health_check",
+                        "add_specific_memory",
+                        "delete_specific_memory",
+                        "clear_embedding_cache",
+                    ],
+                    "suggestion": (
+                        f"Did you mean '{suggestion}'?"
+                        if suggestion
+                        else "Please check the function name"
+                    ),
+                }
+            )
+
+        return error_handler
+
+    async def get_relevant_memories(
+        self,
+        query: str,
+        max_memories: int = None,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Get memories relevant to a specific query using semantic search.
+        These are YOUR dynamic memories, not documents to cite.
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if max_memories is None:
+            max_memories = self.valves.max_memories
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        await emitter.emit("Accessing memory...", "searching", False)
+
+        try:
+            # Get user object
+            user = Users.get_user_by_id(user_id)
+            if not user:
+                return json.dumps({"error": "User not found"})
+
+            # Import inside function
+            from open_webui.routers.memories import query_memory, QueryMemoryForm
+            from fastapi.requests import Request
+            import open_webui.main
+
+            # Query memories
+            memories_result = await query_memory(
+                request=Request(scope={"type": "http", "app": open_webui.main.app}),
+                form_data=QueryMemoryForm(content=query, k=30),  # Get plenty of results
+                user=user,
+            )
+
+            # DEBUG: Log what we got back
+            LOGGER.info(f"DEBUG: query_memory returned type: {type(memories_result)}")
+            LOGGER.info(f"DEBUG: query_memory returned: {memories_result}")
+
+            if not memories_result:
+                await emitter.emit("No memories found", "complete", True)
+                return json.dumps(
+                    {
+                        "memories": [],
+                        "message": "No memories stored yet",
+                        "query": query,
+                    }
+                )
+
+            # Parse the SearchResult format
+            result_memories = []
+
+            try:
+                # Extract components from SearchResult object
+                ids = memories_result.ids[0]
+                documents = memories_result.documents[0]
+                metadatas = memories_result.metadatas[0]
+                distances = memories_result.distances[0]
+
+                LOGGER.info(f"DEBUG: Found {len(documents)} documents")
+                LOGGER.info(f"DEBUG: Distances: {distances}")
+                LOGGER.info(
+                    f"DEBUG: Distance threshold: {self.valves.memories_dist_max}"
+                )
+
+                # Process each memory
+                for i in range(len(documents)):
+                    distance = distances[i]
+                    LOGGER.info(
+                        f"DEBUG: Memory {i}: distance={distance}, content={documents[i][:50]}..."
+                    )
+
+                    # Check distance threshold
+                    if distance <= self.valves.memories_dist_max:
+                        content = documents[i]
+                        if len(content) > self.valves.memory_length_cutoff:
+                            content = (
+                                content[: self.valves.memory_length_cutoff] + "..."
+                            )
+
+                        result_memories.append(
+                            {
+                                "id": ids[i],
+                                "content": content,
+                                "relevance": round(1.0 - distance, 3),
+                                "created": safe_datetime_format(
+                                    metadatas[i].get("created_at", None)
+                                ),
+                            }
+                        )
+
+                        if len(result_memories) >= max_memories:
+                            LOGGER.info(
+                                f"DEBUG: Reached max_memories limit of {max_memories}"
+                            )
+                            break
+
+            except Exception as e:
+                LOGGER.error(f"Error parsing memory results: {e}", exc_info=True)
+                return json.dumps({"error": f"Memory parsing failed: {str(e)}"})
+
+            LOGGER.info(
+                f"DEBUG: Returning {len(result_memories)} memories after filtering"
+            )
+            await emitter.emit(
+                f"Retrieved {len(result_memories)} memories", "complete", True
+            )
+
+            return json.dumps(
+                {
+                    "memories": result_memories,
+                    "query": query,
+                    "total_found": len(result_memories),
+                    "source": "hybrid_dynamic_memory",
+                    "note": "These are my working memories, not documents",
+                },
+                ensure_ascii=False,
+            )
+
+        except Exception as exc:
+            LOGGER.error(f"Error in get_relevant_memories: {exc}", exc_info=True)
+            await emitter.emit("Memory access failed", "error", True)
+            return json.dumps({"error": str(exc), "type": str(type(exc).__name__)})
+
+    async def analyze_memory_patterns(
+        self,
+        time_range: str = "all",  # "today", "week", "month", "all"
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Analyze memory patterns and storage statistics.
+        Helps understand what's being remembered and identify issues.
+
+        :param time_range: Time period to analyze ("today", "week", "month", "all")
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: JSON with memory statistics and patterns
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        await emitter.emit("Analyzing memory patterns...", "processing", False)
+
+        try:
+            all_memories = Memories.get_memories_by_user_id(user_id)
+
+            if not all_memories:
+                await emitter.emit("No memories to analyze", "complete", True)
+                return json.dumps({"message": "No memories stored yet"})
+
+            # Filter by time range
+            now = datetime.datetime.now()
+            filtered_memories = []
+
+            for memory in all_memories:
+                memory_date = memory.created_at
+
+                # Handle different date formats
+                if isinstance(memory_date, int) or isinstance(memory_date, float):
+                    memory_date = datetime.datetime.fromtimestamp(memory_date)
+                elif isinstance(memory_date, str):
+                    try:
+                        memory_date = datetime.datetime.fromisoformat(memory_date)
+                    except:
+                        memory_date = now
+                elif hasattr(memory_date, "timestamp"):
+                    try:
+                        memory_date = datetime.datetime.fromtimestamp(
+                            memory_date.timestamp()
+                        )
+                    except:
+                        if not isinstance(memory_date, datetime.datetime):
+                            memory_date = now
+
+                if not isinstance(memory_date, datetime.datetime):
+                    memory_date = now
+
+                days_difference = (now - memory_date).days
+
+                if time_range == "today" and days_difference == 0:
+                    filtered_memories.append(memory)
+                elif time_range == "week" and days_difference <= 7:
+                    filtered_memories.append(memory)
+                elif time_range == "month" and days_difference <= 30:
+                    filtered_memories.append(memory)
+                elif time_range == "all":
+                    filtered_memories.append(memory)
+
+            # Analyze patterns
+            total_memories = len(filtered_memories)
+
+            # Category analysis based on structured prefixes (from user's prompt)
+            categories = {
+                "lists": 0,
+                "health_data": 0,
+                "preferences": 0,
+                "personal_info": 0,
+                "conversations": 0,
+                "technical": 0,
+                "scheduling": 0,
+                "uncategorized": 0,
+            }
+
+            # Analyze memory types and content patterns
+            memory_types = {
+                "user_messages": 0,
+                "assistant_responses": 0,
+                "structured_data": 0,
+            }
+
+            # Track unique topics using semantic grouping
+            topic_samples = {
+                "lists": [],
+                "health_data": [],
+                "preferences": [],
+                "personal_info": [],
+                "conversations": [],
+            }
+
+            for memory in filtered_memories:
+                content_lower = memory.content.lower()
+                categorized = False
+
+                # Check for structured data formats (as per user's prompt)
+                if content_lower.startswith("user:"):
+                    memory_types["user_messages"] += 1
+                    categories["conversations"] += 1
+                    categorized = True
+                elif content_lower.startswith("assistant:"):
+                    memory_types["assistant_responses"] += 1
+                    categories["conversations"] += 1
+                    categorized = True
+                else:
+                    memory_types["structured_data"] += 1
+
+                    # Check for category prefixes
+                    if any(
+                        x in content_lower
+                        for x in ["shopping list:", "to-do list:", "list:", "items:"]
+                    ):
+                        categories["lists"] += 1
+                        if len(topic_samples["lists"]) < 3:
+                            topic_samples["lists"].append(memory.content[:100])
+                        categorized = True
+
+                    if any(
+                        x in content_lower
+                        for x in [
+                            "health data:",
+                            "medical:",
+                            "medication:",
+                            "symptoms:",
+                            "diagnosis:",
+                        ]
+                    ):
+                        categories["health_data"] += 1
+                        if len(topic_samples["health_data"]) < 3:
+                            topic_samples["health_data"].append(memory.content[:100])
+                        categorized = True
+
+                    if any(
+                        x in content_lower
+                        for x in [
+                            "preferences:",
+                            "likes:",
+                            "dislikes:",
+                            "favorite:",
+                            "prefer:",
+                        ]
+                    ):
+                        categories["preferences"] += 1
+                        if len(topic_samples["preferences"]) < 3:
+                            topic_samples["preferences"].append(memory.content[:100])
+                        categorized = True
+
+                    if any(
+                        x in content_lower
+                        for x in [
+                            "name:",
+                            "birthday:",
+                            "address:",
+                            "phone:",
+                            "email:",
+                            "work:",
+                            "family:",
+                        ]
+                    ):
+                        categories["personal_info"] += 1
+                        if len(topic_samples["personal_info"]) < 3:
+                            topic_samples["personal_info"].append(memory.content[:100])
+                        categorized = True
+
+                    if any(
+                        x in content_lower
+                        for x in [
+                            "code:",
+                            "function:",
+                            "error:",
+                            "debug:",
+                            "api:",
+                            "script:",
+                        ]
+                    ):
+                        categories["technical"] += 1
+                        categorized = True
+
+                    if any(
+                        x in content_lower
+                        for x in [
+                            "meeting:",
+                            "appointment:",
+                            "schedule:",
+                            "deadline:",
+                            "calendar:",
+                        ]
+                    ):
+                        categories["scheduling"] += 1
+                        categorized = True
+
+                if not categorized:
+                    categories["uncategorized"] += 1
+
+            # Calculate memory health metrics
+            avg_memory_length = sum(len(m.content) for m in filtered_memories) / max(
+                total_memories, 1
+            )
+
+            # Check for potential issues
+            issues = []
+            recommendations = []
+
+            # Check for imbalanced categories
+            if total_memories > 50:
+                conv_ratio = categories["conversations"] / total_memories
+                if conv_ratio > 0.8:
+                    issues.append(
+                        f"High conversation ratio ({conv_ratio:.1%}) - mostly storing raw dialogue"
+                    )
+                    recommendations.append(
+                        "Consider consolidating old conversations into structured summaries"
+                    )
+                elif memory_types["structured_data"] / total_memories < 0.2:
+                    issues.append(
+                        "Low structured data ratio - mostly unstructured conversations"
+                    )
+                    recommendations.append(
+                        "Use structured prefixes like 'Shopping list:' or 'Health data:' for better organization"
+                    )
+
+            # Check for memory length issues
+            oversized = [m for m in filtered_memories if len(m.content) > 500]
+            if oversized:
+                issues.append(f"{len(oversized)} oversized memories (>500 chars)")
+                recommendations.append(
+                    "Consider breaking up long memories or summarizing them"
+                )
+
+            tiny = [m for m in filtered_memories if len(m.content) < 30]
+            if len(tiny) > total_memories * 0.3:
+                issues.append(f"{len(tiny)} tiny memories (<30 chars)")
+                recommendations.append("Consider consolidating small related memories")
+
+            # Check for duplication potential
+            if total_memories > 100:
+                recommendations.append(
+                    "Run deduplicate_memories() to check for duplicates"
+                )
+
+            if total_memories > 500:
+                recommendations.append(
+                    "Consider consolidating old memories with consolidate_memories()"
+                )
+
+            # Determine health status
+            if len(issues) == 0:
+                health_status = "excellent"
+            elif len(issues) <= 2:
+                health_status = "good"
+            elif len(issues) <= 4:
+                health_status = "fair"
+            else:
+                health_status = "needs attention"
+
+            await emitter.emit("Analysis complete", "complete", True)
+
+            return json.dumps(
+                {
+                    "time_range": time_range,
+                    "total_memories": total_memories,
+                    "average_memory_length": round(avg_memory_length, 1),
+                    "category_distribution": categories,
+                    "memory_types": memory_types,
+                    "sample_topics": {k: v for k, v in topic_samples.items() if v},
+                    "health_status": health_status,
+                    "issues": issues,
+                    "recommendations": recommendations,
+                    "source": "hybrid_dynamic_memory",
+                },
+                ensure_ascii=False,
+            )
+
+        except Exception as exc:
+            LOGGER.error(f"Error analyzing memories: {exc}")
+            await emitter.emit("Analysis failed", "error", True)
+            return json.dumps({"error": str(exc)})
+
+    async def consolidate_memories(
+        self,
+        topic: str = None,
+        max_age_days: int = 30,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Consolidate related memories into summaries to reduce clutter.
+        Combines multiple related memories into concise entries.
+
+        :param topic: Specific topic to consolidate (optional)
+        :param max_age_days: Only consolidate memories older than this
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: JSON with consolidation results
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        await emitter.emit("Consolidating memories...", "processing", False)
+
+        try:
+            all_memories = Memories.get_memories_by_user_id(user_id)
+
+            if not all_memories:
+                return json.dumps({"message": "No memories to consolidate"})
+
+            # Filter old memories
+            now = datetime.datetime.now()
+            old_memories = []
+
+            for memory in all_memories:
+                try:
+                    memory_date = memory.created_at
+                    if hasattr(memory_date, "timestamp"):
+                        memory_date = datetime.datetime.fromtimestamp(
+                            memory_date.timestamp()
+                        )
+
+                    if (now - memory_date).days >= max_age_days:
+                        if not topic or topic.lower() in memory.content.lower():
+                            old_memories.append(memory)
+                except:
+                    continue
+
+            if len(old_memories) < 2:
+                await emitter.emit(
+                    "Not enough memories to consolidate", "complete", True
+                )
+                return json.dumps({"message": "Not enough old memories to consolidate"})
+
+            # Group similar memories
+            groups = []
+            used = set()
+
+            for i, mem1 in enumerate(old_memories):
+                if i in used:
+                    continue
+
+                group = [mem1]
+                used.add(i)
+
+                for j, mem2 in enumerate(old_memories[i + 1 :], i + 1):
+                    if j in used:
+                        continue
+
+                    # Simple similarity check
+                    words1 = set(mem1.content.lower().split())
+                    words2 = set(mem2.content.lower().split())
+
+                    if len(words1 & words2) / max(len(words1), len(words2), 1) > 0.3:
+                        group.append(mem2)
+                        used.add(j)
+
+                if len(group) > 1:
+                    groups.append(group)
+
+            # Consolidate groups
+            consolidated_count = 0
+            deleted_count = 0
+
+            for group in groups:
+                # Create consolidated memory
+                contents = [m.content for m in group]
+                consolidated = f"[Consolidated from {len(group)} memories]: "
+
+                # Extract key information
+                key_points = set()
+                for content in contents:
+                    # Extract key phrases
+                    if ":" in content:
+                        key_points.add(content.split(":", 1)[1].strip()[:100])
+                    else:
+                        key_points.add(content[:100])
+
+                consolidated += "; ".join(list(key_points)[:3])
+
+                # Store consolidated memory
+                Memories.insert_new_memory(user_id, consolidated)
+                consolidated_count += 1
+
+                # Delete old memories
+                for memory in group:
+                    try:
+                        await delete_memory_by_id(
+                            request=Request(
+                                scope={"type": "http", "app": open_webui.main.app}
+                            ),
+                            id=memory.id,
+                            user=Users.get_user_by_id(user_id),
+                        )
+                        deleted_count += 1
+                    except:
+                        pass
+
+            await emitter.emit("Consolidation complete", "complete", True)
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "consolidated_groups": len(groups),
+                    "memories_consolidated": deleted_count,
+                    "new_consolidated_memories": consolidated_count,
+                    "message": f"Consolidated {deleted_count} memories into {consolidated_count} summaries",
+                    "source": "hybrid_dynamic_memory",
+                }
+            )
+
+        except Exception as exc:
+            LOGGER.error(f"Error consolidating memories: {exc}")
+            await emitter.emit("Consolidation failed", "error", True)
+            return json.dumps({"error": str(exc)})
+
+    async def export_memories(
+        self,
+        format: str = "json",  # "json", "markdown", "text"
+        include_dates: bool = True,
+        limit: int = None,  # Add limit parameter
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Export all memories to a formatted string for backup or review.
+
+        :param format: Output format ("json", "markdown", "text")
+        :param include_dates: Include timestamps
+        :param limit: Maximum number of memories to export (None for all)
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: Formatted memory export
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        await emitter.emit("Exporting memories...", "processing", False)
+
+        try:
+            all_memories = Memories.get_memories_by_user_id(user_id)
+
+            if not all_memories:
+                return json.dumps({"message": "No memories to export"})
+
+            # Sort by date
+            memories_sorted = sorted(
+                all_memories, key=lambda x: x.created_at, reverse=True
+            )
+
+            # Apply limit if specified
+            if limit:
+                memories_sorted = memories_sorted[:limit]
+                await emitter.emit(
+                    f"Exporting {limit} most recent memories...", "processing", False
+                )
+            else:
+                await emitter.emit(
+                    f"Exporting all {len(memories_sorted)} memories...",
+                    "processing",
+                    False,
+                )
+
+            if format == "json":
+                export_data = []
+                for memory in memories_sorted:
+                    entry = {"content": memory.content}
+                    if include_dates:
+                        entry["created"] = safe_datetime_format(memory.created_at)
+                        entry["id"] = memory.id
+                    export_data.append(entry)
+
+                result = json.dumps(export_data, ensure_ascii=False, indent=2)
+
+            elif format == "markdown":
+                lines = ["# Memory Export\n"]
+                for memory in memories_sorted:
+                    if include_dates:
+                        date_str = safe_datetime_format(memory.created_at)
+                        lines.append(f"## {date_str}\n")
+                    lines.append(f"- {memory.content}\n")
+                result = "\n".join(lines)
+
+            else:  # text format
+                lines = []
+                for memory in memories_sorted:
+                    if include_dates:
+                        date_str = safe_datetime_format(memory.created_at)
+                        lines.append(f"[{date_str}]")
+                    lines.append(memory.content)
+                    lines.append("")  # Empty line between entries
+                result = "\n".join(lines)
+
+            await emitter.emit("Export complete", "complete", True)
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "format": format,
+                    "total_memories": len(all_memories),
+                    "export": result,
+                    "message": f"Exported {len(all_memories)} memories in {format} format",
+                    "source": "hybrid_dynamic_memory",
+                }
+            )
+
+        except Exception as exc:
+            LOGGER.error(f"Error exporting memories: {exc}")
+            await emitter.emit("Export failed", "error", True)
+            return json.dumps({"error": str(exc)})
+
+    async def search_memories_with_context(
+        self,
+        query: str,
+        context_words: int = 50,
+        max_memories: int = 20,  # NEW: Parameterized instead of hardcoded
+        max_total_chars: int = 10000,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Search memories and return with surrounding context.
+
+        :param query: Search query
+        :param context_words: Characters (not words!) of context to include per memory
+        :param max_memories: Maximum number of memories to return (default 20, was hardcoded at 5)
+        :param max_total_chars: Maximum total characters in response to prevent overflow
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        # Cap context_words to prevent oversized responses
+        context_words = min(context_words, 2000)
+        # Cap max_memories to prevent excessive results
+        max_memories = min(max_memories, 50)
+
+        await emitter.emit("Searching with context...", "searching", False)
+
+        try:
+            all_memories = Memories.get_memories_by_user_id(user_id)
+
+            if not all_memories:
+                return json.dumps({"memories": [], "message": "No memories found"})
+
+            memories_sorted = sorted(all_memories, key=lambda x: x.created_at)
+            matches = []
+            query_lower = query.lower()
+            total_chars = 0
+
+            # IMPROVED: Split query into words for more flexible matching
+            # This allows "hybrid tool" to match "hybrid memory tool"
+            query_words = [w.strip() for w in query_lower.split() if len(w.strip()) > 2]
+            
+            # If query has no valid words (too short), fall back to exact match
+            use_word_matching = len(query_words) > 0
+
+            for i, memory in enumerate(memories_sorted):
+                memory_content_lower = memory.content.lower()
+                
+                # IMPROVED MATCHING: Check if any query words are in the memory
+                is_match = False
+                if use_word_matching:
+                    # Match if ALL query words appear in the memory (allows different order)
+                    is_match = all(word in memory_content_lower for word in query_words)
+                else:
+                    # Fall back to exact substring match for very short queries
+                    is_match = query_lower in memory_content_lower
+
+                if is_match:
+                    # Build context with size tracking
+                    context_before = []
+                    context_after = []
+
+                    # Get previous memories for context
+                    for j in range(max(0, i - 2), i):
+                        context_before.append(
+                            memories_sorted[j].content[:context_words]
+                        )
+
+                    # Get following memories for context
+                    for j in range(i + 1, min(len(memories_sorted), i + 3)):
+                        context_after.append(memories_sorted[j].content[:context_words])
+
+                    match_entry = {
+                        "content": memory.content[:5000],  # Cap individual memory size
+                        "context_before": context_before,
+                        "context_after": context_after,
+                        "created": safe_datetime_format(memory.created_at),
+                        "id": memory.id,
+                    }
+
+                    # Estimate size of this match
+                    match_size = len(json.dumps(match_entry))
+                    if total_chars + match_size > max_total_chars:
+                        LOGGER.warning(
+                            f"Response size limit reached at {len(matches)} matches"
+                        )
+                        break
+
+                    total_chars += match_size
+                    matches.append(match_entry)
+                    
+                    # FIXED: Stop when we reach the requested max_memories
+                    if len(matches) >= max_memories:
+                        break
+
+            await emitter.emit(
+                f"Found {len(matches)} memories with context", "complete", True
+            )
+
+            result = {
+                "query": query,
+                "matches_found": len(matches),
+                "memories_with_context": matches,  # FIXED: Removed hardcoded [:5] slice
+                "total_response_chars": total_chars,
+                "context_words_used": context_words,
+                "max_memories_limit": max_memories,
+                "source": "hybrid_dynamic_memory",
+            }
+
+            return json.dumps(result, ensure_ascii=False)
+
+        except Exception as exc:
+            LOGGER.error(f"Error searching with context: {exc}", exc_info=True)
+            await emitter.emit("Search failed", "error", True)
+            return json.dumps({"error": str(exc), "query": query})
+
+    async def deduplicate_memories(
+        self,
+        similarity_threshold: float = 0.95,
+        dry_run: bool = True,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Find and optionally remove duplicate or near-duplicate memories.
+
+        :param similarity_threshold: How similar memories must be to count as duplicates (0.0-1.0)
+        :param dry_run: If True, only report duplicates without removing
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: List of duplicates found/removed
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        await emitter.emit("Finding duplicate memories...", "processing", False)
+
+        try:
+            all_memories = Memories.get_memories_by_user_id(user_id)
+
+            if not all_memories:
+                return json.dumps({"message": "No memories to deduplicate"})
+
+            # Find duplicates
+            duplicates = []
+            checked = set()
+
+            for i, mem1 in enumerate(all_memories):
+                if mem1.id in checked:
+                    continue
+
+                for j, mem2 in enumerate(all_memories[i + 1 :], i + 1):
+                    if mem2.id in checked:
+                        continue
+
+                    # Calculate similarity
+                    content1 = mem1.content.lower().strip()
+                    content2 = mem2.content.lower().strip()
+
+                    # Exact match
+                    if content1 == content2:
+                        similarity = 1.0
+                    else:
+                        # Simple word-based similarity
+                        words1 = set(content1.split())
+                        words2 = set(content2.split())
+
+                        if not words1 or not words2:
+                            similarity = 0
+                        else:
+                            intersection = len(words1 & words2)
+                            union = len(words1 | words2)
+                            similarity = intersection / union if union > 0 else 0
+
+                    if similarity >= similarity_threshold:
+                        duplicates.append(
+                            {
+                                "original": {
+                                    "id": mem1.id,
+                                    "content": mem1.content[:100],
+                                    "created": safe_datetime_format(mem1.created_at),
+                                },
+                                "duplicate": {
+                                    "id": mem2.id,
+                                    "content": mem2.content[:100],
+                                    "created": safe_datetime_format(mem2.created_at),
+                                },
+                                "similarity": round(similarity, 3),
+                            }
+                        )
+                        checked.add(mem2.id)
+
+            # Remove duplicates if not dry run
+            removed_count = 0
+            if not dry_run and duplicates:
+                await emitter.emit(
+                    f"Removing {len(duplicates)} duplicate memories...",
+                    "processing",
+                    False,
+                )
+                for dup in duplicates:
+                    try:
+                        # Use the Memories model directly (bypassing the router)
+                        result = Memories.delete_memory_by_id_and_user_id(
+                            dup["duplicate"]["id"], user_id
+                        )
+                        if result:
+                            # OpenWebUI handles vector DB deletion internally
+                            removed_count += 1
+                    except Exception as e:
+                        LOGGER.error(
+                            f"Failed to remove duplicate {dup['duplicate']['id']}: {e}"
+                        )
+
+            # Send appropriate completion message based on what actually happened
+            if dry_run:
+                await emitter.emit(
+                    f"Duplicate search complete: found {len(duplicates)} duplicates",
+                    "complete",
+                    True,
+                )
+            else:
+                await emitter.emit(
+                    f"Deduplication complete: removed {removed_count} duplicates",
+                    "complete",
+                    True,
+                )
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "dry_run": dry_run,
+                    "duplicates_found": len(duplicates),
+                    "duplicates_removed": removed_count if not dry_run else 0,
+                    "duplicate_pairs": duplicates[:10],  # Limit output
+                    "message": f"Found {len(duplicates)} duplicates"
+                    + (f", removed {removed_count}" if not dry_run else ""),
+                    "source": "hybrid_dynamic_memory",
+                }
+            )
+
+        except Exception as exc:
+            LOGGER.error(f"Error deduplicating memories: {exc}")
+            await emitter.emit("Deduplication failed", "error", True)
+            return json.dumps({"error": str(exc)})
+
+    async def memory_health_check(
+        self,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Comprehensive health check of the memory system.
+        Checks for issues, performance problems, and optimization opportunities.
+
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: Health report with recommendations
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        await emitter.emit("Running comprehensive health check...", "processing", False)
+
+        try:
+            import os
+
+            # Get all memories
+            all_memories = Memories.get_memories_by_user_id(user_id)
+            total_count = len(all_memories) if all_memories else 0
+
+            health_report = {
+                "status": "healthy",
+                "total_memories": total_count,
+                "issues": [],
+                "recommendations": [],
+                "metrics": {},
+            }
+
+            if total_count == 0:
+                health_report["status"] = "empty"
+                health_report["recommendations"].append(
+                    "No memories stored yet - system is ready for use"
+                )
+            else:
+                # Check memory size
+                total_size = sum(len(m.content) for m in all_memories)
+                avg_size = total_size / total_count
+                health_report["metrics"]["total_size_chars"] = total_size
+                health_report["metrics"]["average_size"] = round(avg_size, 1)
+
+                # Check for oversized memories
+                oversized = [m for m in all_memories if len(m.content) > 500]
+                if oversized:
+                    health_report["issues"].append(
+                        f"Found {len(oversized)} oversized memories (>500 chars)"
+                    )
+                    health_report["recommendations"].append(
+                        "Consider breaking up long memories"
+                    )
+
+                # Check for very short memories
+                tiny = [m for m in all_memories if len(m.content) < 20]
+                if len(tiny) > total_count * 0.3:
+                    health_report["issues"].append(
+                        f"Many tiny memories ({len(tiny)} under 20 chars)"
+                    )
+                    health_report["recommendations"].append(
+                        "Consider consolidating small memories"
+                    )
+
+                # Check for potential duplicates
+                contents = [m.content.lower()[:50] for m in all_memories]
+                unique_starts = len(set(contents))
+                duplicate_ratio = 1 - (unique_starts / total_count)
+
+                if duplicate_ratio > 0.2:
+                    health_report["issues"].append(
+                        f"High duplicate ratio: {duplicate_ratio:.1%}"
+                    )
+                    health_report["recommendations"].append(
+                        "Run deduplicate_memories() to clean up"
+                    )
+
+                # Check age distribution
+                now = datetime.datetime.now()
+                old_memories = 0
+                for memory in all_memories:
+                    try:
+                        created = memory.created_at
+                        if hasattr(created, "timestamp"):
+                            created = datetime.datetime.fromtimestamp(
+                                created.timestamp()
+                            )
+                        if (now - created).days > 90:
+                            old_memories += 1
+                    except:
+                        pass
+
+                if old_memories > total_count * 0.5:
+                    health_report["issues"].append(
+                        f"{old_memories} memories are over 90 days old"
+                    )
+                    health_report["recommendations"].append(
+                        "Consider consolidating old memories"
+                    )
+
+                # Check cache size
+                cache_paths = [
+                    os.path.expanduser("~/.cache/torch/sentence_transformers/"),
+                    os.path.expanduser("~/.cache/huggingface/"),
+                ]
+
+                total_cache_mb = 0
+                for path in cache_paths:
+                    if os.path.exists(path):
+                        for dirpath, dirnames, filenames in os.walk(path):
+                            for f in filenames:
+                                fp = os.path.join(dirpath, f)
+                                try:
+                                    total_cache_mb += os.path.getsize(fp) / (
+                                        1024 * 1024
+                                    )
+                                except:
+                                    pass
+
+                health_report["metrics"]["cache_size_mb"] = round(total_cache_mb, 1)
+
+                if total_cache_mb > 500:
+                    health_report["issues"].append(
+                        f"Large cache size: {total_cache_mb:.1f} MB"
+                    )
+                    health_report["recommendations"].append(
+                        "Run clear_embedding_cache() to free space"
+                    )
+
+                # Overall health assessment
+                if len(health_report["issues"]) == 0:
+                    health_report["status"] = "excellent"
+                elif len(health_report["issues"]) <= 2:
+                    health_report["status"] = "good"
+                elif len(health_report["issues"]) <= 4:
+                    health_report["status"] = "fair"
+                else:
+                    health_report["status"] = "needs attention"
+
+                # Performance recommendations
+                if total_count > 1000:
+                    health_report["recommendations"].append(
+                        "Consider consolidating memories for better performance"
+                    )
+                if total_count > 5000:
+                    health_report["recommendations"].append(
+                        "Large memory store - regular maintenance recommended"
+                    )
+
+            await emitter.emit("Health check complete", "complete", True)
+
+            return json.dumps(health_report, ensure_ascii=False)
+
+        except Exception as exc:
+            LOGGER.error(f"Error in health check: {exc}")
+            await emitter.emit("Health check failed", "error", True)
+            return json.dumps({"error": str(exc)})
+
+    async def add_specific_memory(
+        self,
+        memory_content: str,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Store a specific memory.
+        This becomes part of YOUR memory, not an external document.
+
+        :param memory_content: Content to store in memory
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: JSON string with result
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        await emitter.emit("Storing in memory...", "storing", False)
+
+        try:
+            # Limit memory length
+            if len(memory_content) > 500:
+                memory_content = memory_content[:500] + "..."
+
+            new_memory = Memories.insert_new_memory(user_id, memory_content)
+
+            if new_memory:
+                await emitter.emit("Memorized", "complete", True)
+                return json.dumps(
+                    {
+                        "success": True,
+                        "message": "Stored in memory",
+                        "content": memory_content,
+                        "source": "hybrid_dynamic_memory",
+                    }
+                )
+            else:
+                await emitter.emit("Failed to memorize", "error", True)
+                return json.dumps({"error": "Failed to store in memory"})
+
+        except Exception as exc:
+            LOGGER.error(f"Error storing memory: {exc}")
+            await emitter.emit("Memory storage failed", "error", True)
+            return json.dumps({"error": str(exc)})
+
+    async def story_manager(
+        self,
+        action: str,
+        story_name: str = None,
+        content: str = None,
+        chapter_number: int = None,
+        retrieve_from_chapter: int = None,
+        metadata: dict = None,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Manage ongoing creative stories or chronological data with tracking.
+        Designed for bedtime stories, medical reports, and serialized data.
+
+        Actions:
+        - "save_chapter" - Save a new story chapter/segment with optional metadata
+        - "update_chapter" - Update existing chapter content
+        - "get_full_story" - Retrieve entire story from beginning
+        - "get_from_chapter" - Retrieve story from specific chapter onwards
+        - "get_summary" - Get story outline and chapter list
+        - "search_story" - Search for content within a specific story
+        - "delete_story" - Remove entire story
+        - "export_for_physician" - Export formatted report (medical use)
+
+        :param action: Action to perform
+        :param story_name: Name of the story (e.g., "Axiom" or "PatientName_Labs")
+        :param content: Content to save (for save_chapter/update_chapter)
+        :param chapter_number: Chapter number (optional, auto-increments for save)
+        :param retrieve_from_chapter: Starting chapter for retrieval
+        :param metadata: Optional dict with metadata (e.g., {"lab_date": "2024-01-15", "lab_type": "CBC"})
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: JSON with results
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        STORY_PREFIX = "STORY_CHAPTER"
+
+        try:
+            if action == "save_chapter":
+                if not story_name or not content:
+                    return json.dumps(
+                        {"error": "story_name and content required for save_chapter"}
+                    )
+
+                await emitter.emit(
+                    f"Saving chapter of {story_name}...", "processing", False
+                )
+
+                try:
+                    # Get existing chapters to determine next chapter number
+                    all_memories = Memories.get_memories_by_user_id(user_id)
+                    story_chapters = [
+                        m
+                        for m in all_memories
+                        if m.content.startswith(f"{STORY_PREFIX}:{story_name}:")
+                    ]
+
+                    # Auto-increment chapter number if not provided
+                    if chapter_number is None:
+                        chapter_number = len(story_chapters) + 1
+
+                    # FIX #3: VALIDATION - Add this block here
+                    if not isinstance(chapter_number, int) or chapter_number < 1:
+                        return json.dumps(
+                            {"error": "chapter_number must be a positive integer"}
+                        )
+                    # END OF FIX #3
+
+                    # Format: STORY_CHAPTER:StoryName:ChapterNum:[META:json]:CONTENT
+                    # Metadata is optional and embedded in content
+                    if metadata:
+                        metadata_json = json.dumps(metadata, ensure_ascii=False)
+                        memory_content = f"{STORY_PREFIX}:{story_name}:{chapter_number}:[META:{metadata_json}]:{content}"
+                    else:
+                        memory_content = (
+                            f"{STORY_PREFIX}:{story_name}:{chapter_number}:{content}"
+                        )
+
+                    # Warn about large chapters
+                    if len(memory_content) > 3000:
+                        LOGGER.warning(
+                            f"Chapter {chapter_number} is large ({len(memory_content)} chars)"
+                        )
+
+                    # Store with error handling
+                    new_memory = Memories.insert_new_memory(user_id, memory_content)
+
+                    if not new_memory:
+                        await emitter.emit("Failed to save chapter", "error", True)
+                        return json.dumps({"error": "Database insert returned None"})
+
+                    await emitter.emit("Chapter saved", "complete", True)
+
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "story_name": story_name,
+                            "chapter_number": chapter_number,
+                            "total_chapters": len(story_chapters) + 1,
+                            "chapter_size_chars": len(content),
+                            "message": f"Saved chapter {chapter_number} of {story_name}",
+                            "source": "hybrid_story_manager",
+                        }
+                    )
+
+                except Exception as e:
+                    LOGGER.error(f"Failed to save chapter: {e}", exc_info=True)
+                    await emitter.emit("Chapter save failed", "error", True)
+                    return json.dumps({"error": f"Save failed: {str(e)}"})
+
+            elif action == "update_chapter":
+                if not story_name or chapter_number is None or not content:
+                    return json.dumps(
+                        {
+                            "error": "story_name, chapter_number, and content required for update_chapter"
+                        }
+                    )
+
+                # VALIDATION: Ensure chapter_number is valid
+                if not isinstance(chapter_number, int) or chapter_number < 1:
+                    return json.dumps(
+                        {"error": "chapter_number must be a positive integer"}
+                    )
+
+                await emitter.emit(
+                    f"Updating chapter {chapter_number} of {story_name}...",
+                    "processing",
+                    False,
+                )
+
+                try:
+                    # Find existing chapter
+                    all_memories = Memories.get_memories_by_user_id(user_id)
+                    target_chapter = None
+
+                    for m in all_memories:
+                        if m.content.startswith(f"{STORY_PREFIX}:{story_name}:"):
+                            try:
+                                parts = m.content.split(":", 3)
+                                if len(parts) >= 3:
+                                    existing_chapter_num = int(
+                                        parts[2].split("[")[0]
+                                    )  # Handle metadata
+                                    if existing_chapter_num == chapter_number:
+                                        target_chapter = m
+                                        break
+                            except (ValueError, IndexError):
+                                continue
+
+                    if not target_chapter:
+                        await emitter.emit("Chapter not found", "error", True)
+                        return json.dumps(
+                            {
+                                "error": f"Chapter {chapter_number} not found in {story_name}"
+                            }
+                        )
+
+                    # SAFETY FIX: Extract metadata from old chapter BEFORE deletion
+                    old_metadata = None
+                    try:
+                        parts = target_chapter.content.split(":", 3)
+                        if len(parts) == 4:
+                            chapter_content = parts[3]
+                            # Check if content has metadata prefix
+                            if chapter_content.startswith("[META:"):
+                                meta_end = chapter_content.find("]:")
+                                if meta_end != -1:
+                                    meta_json = chapter_content[6:meta_end]
+                                    try:
+                                        old_metadata = json.loads(meta_json)
+                                        LOGGER.info(
+                                            f"Preserved metadata from old chapter: {old_metadata}"
+                                        )
+                                    except json.JSONDecodeError:
+                                        LOGGER.warning(
+                                            "Could not parse metadata from old chapter"
+                                        )
+                    except Exception as e:
+                        LOGGER.warning(f"Could not extract old metadata: {e}")
+
+                    # If no new metadata provided, preserve old metadata
+                    if old_metadata and not metadata:
+                        metadata = old_metadata
+                        LOGGER.info("Using preserved metadata for updated chapter")
+
+                    # CRITICAL SAFETY FIX: Save new chapter FIRST, delete old AFTER
+                    # This prevents data loss if the save fails
+                    
+                    # Format new chapter content
+                    if metadata:
+                        metadata_json = json.dumps(metadata, ensure_ascii=False)
+                        memory_content = f"{STORY_PREFIX}:{story_name}:{chapter_number}:[META:{metadata_json}]:{content}"
+                    else:
+                        memory_content = f"{STORY_PREFIX}:{story_name}:{chapter_number}:{content}"
+
+                    # Save new chapter FIRST
+                    new_memory = Memories.insert_new_memory(user_id, memory_content)
+
+                    if not new_memory:
+                        await emitter.emit(
+                            "Failed to save updated chapter", "error", True
+                        )
+                        return json.dumps(
+                            {
+                                "error": "Database insert failed - original chapter preserved",
+                                "note": "Your original data is safe - no changes were made",
+                            }
+                        )
+
+                    # Only delete old chapter AFTER successful save
+                    try:
+                        result = Memories.delete_memory_by_id_and_user_id(
+                            target_chapter.id, user_id
+                        )
+                        if not result:
+                            # New chapter saved but couldn't delete old one
+                            # This creates a duplicate but data is safe
+                            LOGGER.warning(
+                                f"Updated chapter saved but could not delete old chapter {target_chapter.id}"
+                            )
+                            await emitter.emit(
+                                "Chapter updated (manual cleanup needed)", "complete", True
+                            )
+                            return json.dumps(
+                                {
+                                    "success": True,
+                                    "story_name": story_name,
+                                    "chapter_number": chapter_number,
+                                    "message": f"Updated chapter {chapter_number} of {story_name}",
+                                    "note": "Old version still exists - you may want to delete it manually",
+                                    "old_chapter_id": target_chapter.id,
+                                    "source": "hybrid_story_manager",
+                                }
+                            )
+                    except Exception as e:
+                        # New chapter is saved successfully, just couldn't delete old one
+                        LOGGER.warning(
+                            f"Could not delete old chapter after successful update: {e}"
+                        )
+                        await emitter.emit(
+                            "Chapter updated (cleanup needed)", "complete", True
+                        )
+                        return json.dumps(
+                            {
+                                "success": True,
+                                "story_name": story_name,
+                                "chapter_number": chapter_number,
+                                "message": f"Updated chapter {chapter_number} of {story_name}",
+                                "note": "Old version may still exist due to deletion error",
+                                "source": "hybrid_story_manager",
+                            }
+                        )
+
+                    # Success - both save and delete worked
+                    await emitter.emit("Chapter updated", "complete", True)
+
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "story_name": story_name,
+                            "chapter_number": chapter_number,
+                            "message": f"Updated chapter {chapter_number} of {story_name}",
+                            "metadata_preserved": old_metadata is not None,
+                            "source": "hybrid_story_manager",
+                        }
+                    )
+
+                except Exception as e:
+                    LOGGER.error(f"Failed to update chapter: {e}", exc_info=True)
+                    await emitter.emit("Chapter update failed", "error", True)
+                    return json.dumps({"error": f"Update failed: {str(e)}"})
+
+            elif action == "get_full_story":
+                if not story_name:
+                    return json.dumps(
+                        {"error": "story_name required for get_full_story"}
+                    )
+
+                await emitter.emit(f"Retrieving {story_name}...", "processing", False)
+
+                all_memories = Memories.get_memories_by_user_id(user_id)
+                story_chapters = []
+
+                for m in all_memories:
+                    if m.content.startswith(f"{STORY_PREFIX}:{story_name}:"):
+                        try:
+                            # Parse: STORY_CHAPTER:StoryName:ChapterNum:[META:json]:CONTENT
+                            # or: STORY_CHAPTER:StoryName:ChapterNum:CONTENT (legacy)
+                            parts = m.content.split(":", 3)
+                            if len(parts) == 4:
+                                # Check for metadata
+                                chapter_metadata = None
+                                chapter_content = parts[3]
+
+                                # Extract chapter number (might have [META:...] attached)
+                                chapter_num_str = parts[2]
+                                chapter_num = int(chapter_num_str)
+
+                                # Check if content has metadata prefix
+                                if chapter_content.startswith("[META:"):
+                                    meta_end = chapter_content.find("]:")
+                                    if meta_end != -1:
+                                        meta_json = chapter_content[6:meta_end]
+                                        try:
+                                            chapter_metadata = json.loads(meta_json)
+                                        except json.JSONDecodeError:
+                                            LOGGER.warning(
+                                                f"Could not parse metadata for chapter {chapter_num}"
+                                            )
+                                        chapter_content = chapter_content[
+                                            meta_end + 2 :
+                                        ]
+
+                                chapter_entry = {
+                                    "chapter": chapter_num,
+                                    "content": chapter_content,
+                                    "created": safe_datetime_format(m.created_at),
+                                    "id": m.id,
+                                    "size_chars": len(chapter_content),
+                                }
+
+                                if chapter_metadata:
+                                    chapter_entry["metadata"] = chapter_metadata
+
+                                story_chapters.append(chapter_entry)
+                        except (ValueError, IndexError) as e:
+                            LOGGER.warning(
+                                f"Could not parse chapter from memory {m.id}: {e}"
+                            )
+                            continue
+
+                if not story_chapters:
+                    await emitter.emit("Story not found", "complete", True)
+                    return json.dumps(
+                        {
+                            "message": f"No chapters found for story: {story_name}",
+                            "story_name": story_name,
+                            "chapters": [],
+                        }
+                    )
+
+                # Sort by chapter number
+                story_chapters.sort(key=lambda x: x["chapter"])
+
+                # Build full narrative
+                full_story = "\n\n".join(
+                    [
+                        f"[Chapter {ch['chapter']}]\n{ch['content']}"
+                        for ch in story_chapters
+                    ]
+                )
+
+                total_words = sum(len(ch["content"].split()) for ch in story_chapters)
+
+                await emitter.emit(
+                    f"Retrieved {len(story_chapters)} chapters", "complete", True
+                )
+
+                return json.dumps(
+                    {
+                        "success": True,
+                        "story_name": story_name,
+                        "total_chapters": len(story_chapters),
+                        "total_words_approx": total_words,
+                        "chapters": story_chapters,
+                        "full_story": full_story,
+                        "source": "hybrid_story_manager",
+                        "note": "This is your creative work, not a document to cite",
+                    },
+                    ensure_ascii=False,
+                )
+
+            elif action == "get_from_chapter":
+                if not story_name or retrieve_from_chapter is None:
+                    return json.dumps(
+                        {"error": "story_name and retrieve_from_chapter required"}
+                    )
+
+                # VALIDATION: Ensure retrieve_from_chapter is valid
+                if not isinstance(retrieve_from_chapter, int) or retrieve_from_chapter < 1:
+                    return json.dumps(
+                        {"error": "retrieve_from_chapter must be a positive integer"}
+                    )
+
+                await emitter.emit(
+                    f"Retrieving {story_name} from chapter {retrieve_from_chapter}...",
+                    "processing",
+                    False,
+                )
+
+                all_memories = Memories.get_memories_by_user_id(user_id)
+                story_chapters = []
+
+                for m in all_memories:
+                    if m.content.startswith(f"{STORY_PREFIX}:{story_name}:"):
+                        try:
+                            parts = m.content.split(":", 3)
+                            if len(parts) == 4:
+                                # Extract chapter number
+                                chapter_num_str = parts[2]
+                                chapter_num = int(chapter_num_str)
+                                
+                                if chapter_num >= retrieve_from_chapter:
+                                    chapter_content = parts[3]
+                                    chapter_metadata = None
+                                    
+                                    # FIXED: Extract metadata if present (like get_full_story does)
+                                    if chapter_content.startswith("[META:"):
+                                        meta_end = chapter_content.find("]:")
+                                        if meta_end != -1:
+                                            meta_json = chapter_content[6:meta_end]
+                                            try:
+                                                chapter_metadata = json.loads(meta_json)
+                                            except json.JSONDecodeError:
+                                                LOGGER.warning(
+                                                    f"Could not parse metadata for chapter {chapter_num}"
+                                                )
+                                            chapter_content = chapter_content[meta_end + 2:]
+                                    
+                                    chapter_entry = {
+                                        "chapter": chapter_num,
+                                        "content": chapter_content,
+                                        "created": safe_datetime_format(m.created_at),
+                                        "id": m.id,
+                                        "size_chars": len(chapter_content),
+                                    }
+                                    
+                                    # Include metadata if present
+                                    if chapter_metadata:
+                                        chapter_entry["metadata"] = chapter_metadata
+                                    
+                                    story_chapters.append(chapter_entry)
+                        except (ValueError, IndexError):
+                            continue
+
+                if not story_chapters:
+                    return json.dumps(
+                        {
+                            "message": f"No chapters found from chapter {retrieve_from_chapter} onwards",
+                            "story_name": story_name,
+                        }
+                    )
+
+                story_chapters.sort(key=lambda x: x["chapter"])
+
+                partial_story = "\n\n".join(
+                    [
+                        f"[Chapter {ch['chapter']}]\n{ch['content']}"
+                        for ch in story_chapters
+                    ]
+                )
+
+                await emitter.emit(
+                    f"Retrieved {len(story_chapters)} chapters", "complete", True
+                )
+
+                return json.dumps(
+                    {
+                        "success": True,
+                        "story_name": story_name,
+                        "from_chapter": retrieve_from_chapter,
+                        "chapters_retrieved": len(story_chapters),
+                        "chapters": story_chapters,
+                        "partial_story": partial_story,
+                        "source": "hybrid_story_manager",
+                    },
+                    ensure_ascii=False,
+                )
+
+            elif action == "get_summary":
+                if not story_name:
+                    return json.dumps({"error": "story_name required for get_summary"})
+
+                await emitter.emit(
+                    f"Getting summary for {story_name}...", "processing", False
+                )
+
+                all_memories = Memories.get_memories_by_user_id(user_id)
+                story_chapters = []
+
+                for m in all_memories:
+                    if m.content.startswith(f"{STORY_PREFIX}:{story_name}:"):
+                        try:
+                            parts = m.content.split(":", 3)
+                            if len(parts) == 4:
+                                chapter_num = int(parts[2])
+                                chapter_preview = (
+                                    parts[3][:100] + "..."
+                                    if len(parts[3]) > 100
+                                    else parts[3]
+                                )
+                                story_chapters.append(
+                                    {
+                                        "chapter": chapter_num,
+                                        "preview": chapter_preview,
+                                        "created": safe_datetime_format(m.created_at),
+                                        "length_chars": len(parts[3]),
+                                        "id": m.id,
+                                    }
+                                )
+                        except (ValueError, IndexError):
+                            continue
+
+                if not story_chapters:
+                    return json.dumps(
+                        {
+                            "message": f"No chapters found for: {story_name}",
+                            "story_name": story_name,
+                        }
+                    )
+
+                story_chapters.sort(key=lambda x: x["chapter"])
+
+                total_length = sum(ch["length_chars"] for ch in story_chapters)
+
+                await emitter.emit("Summary ready", "complete", True)
+
+                return json.dumps(
+                    {
+                        "success": True,
+                        "story_name": story_name,
+                        "total_chapters": len(story_chapters),
+                        "total_length_chars": total_length,
+                        "chapters": story_chapters,
+                        "source": "hybrid_story_manager",
+                    },
+                    ensure_ascii=False,
+                )
+
+            elif action == "search_story":
+                if not story_name or not content:  # 'content' used as search query
+                    return json.dumps(
+                        {
+                            "error": "story_name and search query (as content parameter) required"
+                        }
+                    )
+
+                search_query = content.lower()
+                await emitter.emit(
+                    f"Searching {story_name} for '{search_query}'...",
+                    "processing",
+                    False,
+                )
+
+                try:
+                    # Get all chapters for this story
+                    all_memories = Memories.get_memories_by_user_id(user_id)
+                    matching_chapters = []
+
+                    for m in all_memories:
+                        if m.content.startswith(f"{STORY_PREFIX}:{story_name}:"):
+                            try:
+                                parts = m.content.split(":", 3)
+                                if len(parts) == 4:
+                                    chapter_num = int(
+                                        parts[2].split("[")[0]
+                                    )  # Handle metadata
+                                    chapter_content = parts[3]
+
+                                    # Remove metadata prefix if present
+                                    if chapter_content.startswith("[META:"):
+                                        meta_end = chapter_content.find("]:")
+                                        if meta_end != -1:
+                                            chapter_content = chapter_content[
+                                                meta_end + 2 :
+                                            ]
+
+                                    # Search for query in content
+                                    if search_query in chapter_content.lower():
+                                        # Find context around matches
+                                        matches_in_chapter = []
+                                        content_lower = chapter_content.lower()
+                                        search_pos = 0
+
+                                        while True:
+                                            pos = content_lower.find(
+                                                search_query, search_pos
+                                            )
+                                            if pos == -1:
+                                                break
+
+                                            # Get context (100 chars before and after)
+                                            start = max(0, pos - 100)
+                                            end = min(
+                                                len(chapter_content),
+                                                pos + len(search_query) + 100,
+                                            )
+                                            context = chapter_content[start:end]
+
+                                            # Add ellipsis if truncated
+                                            if start > 0:
+                                                context = "..." + context
+                                            if end < len(chapter_content):
+                                                context = context + "..."
+
+                                            matches_in_chapter.append(
+                                                {"position": pos, "context": context}
+                                            )
+
+                                            search_pos = pos + 1
+
+                                        matching_chapters.append(
+                                            {
+                                                "chapter": chapter_num,
+                                                "match_count": len(matches_in_chapter),
+                                                "matches": matches_in_chapter[
+                                                    :3
+                                                ],  # Limit to 3 per chapter
+                                                "created": safe_datetime_format(
+                                                    m.created_at
+                                                ),
+                                                "id": m.id,
+                                            }
+                                        )
+                            except (ValueError, IndexError):
+                                continue
+
+                    if not matching_chapters:
+                        await emitter.emit("No matches found", "complete", True)
+                        return json.dumps(
+                            {
+                                "message": f"No matches for '{search_query}' in {story_name}",
+                                "story_name": story_name,
+                                "query": search_query,
+                                "matches_found": 0,
+                            }
+                        )
+
+                    # Sort by chapter number
+                    matching_chapters.sort(key=lambda x: x["chapter"])
+
+                    await emitter.emit(
+                        f"Found {len(matching_chapters)} chapters with matches",
+                        "complete",
+                        True,
+                    )
+
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "story_name": story_name,
+                            "query": search_query,
+                            "chapters_with_matches": len(matching_chapters),
+                            "total_matches": sum(
+                                ch["match_count"] for ch in matching_chapters
+                            ),
+                            "matching_chapters": matching_chapters,
+                            "source": "hybrid_story_manager",
+                        },
+                        ensure_ascii=False,
+                    )
+
+                except Exception as e:
+                    LOGGER.error(f"Search failed: {e}", exc_info=True)
+                    await emitter.emit("Search failed", "error", True)
+                    return json.dumps({"error": str(e)})
+
+            elif action == "delete_story":
+                if not story_name:
+                    return json.dumps({"error": "story_name required for delete_story"})
+
+                await emitter.emit(f"Deleting {story_name}...", "processing", False)
+
+                all_memories = Memories.get_memories_by_user_id(user_id)
+                deleted_count = 0
+                failed_count = 0
+
+                for m in all_memories:
+                    if m.content.startswith(f"{STORY_PREFIX}:{story_name}:"):
+                        try:
+                            result = Memories.delete_memory_by_id_and_user_id(
+                                m.id, user_id
+                            )
+                            if result:
+                                deleted_count += 1
+                            else:
+                                failed_count += 1
+                        except Exception as e:
+                            LOGGER.error(f"Failed to delete chapter {m.id}: {e}")
+                            failed_count += 1
+
+                await emitter.emit(
+                    f"Deleted {deleted_count} chapters", "complete", True
+                )
+
+                return json.dumps(
+                    {
+                        "success": True if deleted_count > 0 else False,
+                        "story_name": story_name,
+                        "chapters_deleted": deleted_count,
+                        "chapters_failed": failed_count,
+                        "message": f"Deleted {deleted_count} chapters from story: {story_name}",
+                        "source": "hybrid_story_manager",
+                    }
+                )
+
+            elif action == "export_for_physician":
+                if not story_name:
+                    return json.dumps(
+                        {"error": "story_name required for export_for_physician"}
+                    )
+
+                # Format can be passed as metadata parameter: {"format": "markdown"}
+                export_format = (
+                    (metadata or {}).get("format", "markdown")
+                    if metadata
+                    else "markdown"
+                )
+
+                await emitter.emit(
+                    f"Exporting {story_name} for physician review...",
+                    "processing",
+                    False,
+                )
+
+                try:
+                    # Get all chapters
+                    all_memories = Memories.get_memories_by_user_id(user_id)
+                    story_chapters = []
+
+                    for m in all_memories:
+                        if m.content.startswith(f"{STORY_PREFIX}:{story_name}:"):
+                            try:
+                                parts = m.content.split(":", 3)
+                                if len(parts) == 4:
+                                    chapter_num = int(parts[2].split("[")[0])
+                                    chapter_content = parts[3]
+                                    chapter_metadata = None
+
+                                    # Extract metadata if present
+                                    if chapter_content.startswith("[META:"):
+                                        meta_end = chapter_content.find("]:")
+                                        if meta_end != -1:
+                                            meta_json = chapter_content[6:meta_end]
+                                            try:
+                                                chapter_metadata = json.loads(meta_json)
+                                            except json.JSONDecodeError:
+                                                pass
+                                            chapter_content = chapter_content[
+                                                meta_end + 2 :
+                                            ]
+
+                                    story_chapters.append(
+                                        {
+                                            "chapter": chapter_num,
+                                            "content": chapter_content,
+                                            "metadata": chapter_metadata,
+                                            "created": safe_datetime_format(
+                                                m.created_at
+                                            ),
+                                            "id": m.id,
+                                        }
+                                    )
+                            except (ValueError, IndexError):
+                                continue
+
+                    if not story_chapters:
+                        return json.dumps(
+                            {"message": f"No data found for: {story_name}"}
+                        )
+
+                    # Sort by chapter number
+                    story_chapters.sort(key=lambda x: x["chapter"])
+
+                    # Format for physician
+                    if export_format == "markdown":
+                        report_lines = [
+                            f"# Medical Report: {story_name}",
+                            f"**Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                            f"**Total Records:** {len(story_chapters)}",
+                            "",
+                            "---",
+                            "",
+                        ]
+
+                        for ch in story_chapters:
+                            report_lines.append(f"## Record {ch['chapter']}")
+
+                            if ch.get("metadata"):
+                                report_lines.append("**Metadata:**")
+                                for key, value in ch["metadata"].items():
+                                    report_lines.append(f"- {key}: {value}")
+                                report_lines.append("")
+
+                            report_lines.append(f"**Date Recorded:** {ch['created']}")
+                            report_lines.append("")
+                            report_lines.append(ch["content"])
+                            report_lines.append("")
+                            report_lines.append("---")
+                            report_lines.append("")
+
+                        formatted_report = "\n".join(report_lines)
+
+                    elif export_format == "text":
+                        report_lines = [
+                            f"MEDICAL REPORT: {story_name}",
+                            f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                            f"Total Records: {len(story_chapters)}",
+                            "",
+                            "=" * 70,
+                            "",
+                        ]
+
+                        for ch in story_chapters:
+                            report_lines.append(f"RECORD {ch['chapter']}")
+
+                            if ch.get("metadata"):
+                                for key, value in ch["metadata"].items():
+                                    report_lines.append(f"  {key}: {value}")
+
+                            report_lines.append(f"  Date: {ch['created']}")
+                            report_lines.append("")
+                            report_lines.append(ch["content"])
+                            report_lines.append("")
+                            report_lines.append("-" * 70)
+                            report_lines.append("")
+
+                        formatted_report = "\n".join(report_lines)
+
+                    else:  # JSON format
+                        formatted_report = json.dumps(
+                            {
+                                "report_name": story_name,
+                                "generated": datetime.datetime.now().isoformat(),
+                                "total_records": len(story_chapters),
+                                "records": story_chapters,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+
+                    await emitter.emit("Export complete", "complete", True)
+
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "story_name": story_name,
+                            "format": export_format,
+                            "total_records": len(story_chapters),
+                            "formatted_report": formatted_report,
+                            "source": "hybrid_story_manager",
+                        },
+                        ensure_ascii=False,
+                    )
+
+                except Exception as e:
+                    LOGGER.error(f"Export failed: {e}", exc_info=True)
+                    await emitter.emit("Export failed", "error", True)
+                    return json.dumps({"error": str(e)})
+
+            else:
+                return json.dumps(
+                    {
+                        "error": f"Unknown action: {action}",
+                        "valid_actions": [
+                            "save_chapter",
+                            "update_chapter",
+                            "get_full_story",
+                            "get_from_chapter",
+                            "get_summary",
+                            "search_story",
+                            "export_for_physician",
+                            "delete_story",
+                        ],
+                    }
+                )
+
+        except Exception as exc:
+            LOGGER.error(f"Error in story_manager: {exc}", exc_info=True)
+            await emitter.emit("Story operation failed", "error", True)
+            return json.dumps(
+                {"error": str(exc), "action": action, "story_name": story_name}
+            )
+
+    async def delete_specific_memory(
+        self,
+        memory_id: str = None,
+        search_content: str = None,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Delete a specific memory by ID or search for memories to delete by content.
+        Use this to remove incorrect or outdated memories.
+
+        :param memory_id: Specific memory ID to delete (optional)
+        :param search_content: Search for memories containing this content to delete (optional)
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: JSON string with deletion result
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        user_id = __user__.get("id")
+        if not user_id:
+            return json.dumps({"error": "User ID required"})
+
+        if not memory_id and not search_content:
+            return json.dumps(
+                {"error": "Either memory_id or search_content is required"}
+            )
+
+        await emitter.emit("Searching for memory to delete...", "searching", False)
+
+        try:
+            deleted_count = 0
+            deleted_memories = []
+
+            # If memory_id provided, delete directly
+            if memory_id:
+                try:
+                    # Try to get the memory first to verify it exists
+                    memory = Memories.get_memory_by_id(memory_id)
+                    if memory and memory.user_id == user_id:
+                        # Use the OpenWebUI delete function
+                        await delete_memory_by_id(
+                            request=Request(
+                                scope={"type": "http", "app": open_webui.main.app}
+                            ),
+                            id=memory_id,
+                            user=Users.get_user_by_id(user_id),
+                        )
+                        deleted_count = 1
+                        deleted_memories.append(
+                            {
+                                "id": memory_id,
+                                "content": (
+                                    memory.content[:100] + "..."
+                                    if len(memory.content) > 100
+                                    else memory.content
+                                ),
+                            }
+                        )
+                    else:
+                        await emitter.emit(
+                            "Memory not found or access denied", "error", True
+                        )
+                        return json.dumps(
+                            {
+                                "error": f"Memory {memory_id} not found or not owned by user"
+                            }
+                        )
+                except Exception as e:
+                    LOGGER.error(f"Error deleting memory by ID: {e}")
+                    await emitter.emit("Failed to delete memory", "error", True)
+                    return json.dumps({"error": f"Failed to delete memory: {str(e)}"})
+
+            # If search_content provided, search and delete matching memories
+            elif search_content:
+                # Get all user memories
+                all_memories = Memories.get_memories_by_user_id(user_id)
+
+                if not all_memories:
+                    await emitter.emit("No memories found", "complete", True)
+                    return json.dumps({"message": "No memories to search through"})
+
+                # Find memories containing the search content
+                search_lower = search_content.lower()
+                memories_to_delete = []
+
+                for memory in all_memories:
+                    if search_lower in memory.content.lower():
+                        memories_to_delete.append(memory)
+
+                if not memories_to_delete:
+                    await emitter.emit("No matching memories found", "complete", True)
+                    return json.dumps(
+                        {
+                            "message": f"No memories found containing: {search_content}",
+                            "deleted_count": 0,
+                        }
+                    )
+
+                # Delete each matching memory
+                for memory in memories_to_delete:
+                    try:
+                        # Use the Memories model directly (bypassing the router)
+                        result = Memories.delete_memory_by_id_and_user_id(
+                            memory.id, user_id
+                        )
+                        if result:
+                            # OpenWebUI handles vector DB deletion internally
+
+                            deleted_count += 1
+                            deleted_memories.append(
+                                {
+                                    "id": memory.id,
+                                    "content": (
+                                        memory.content[:100] + "..."
+                                        if len(memory.content) > 100
+                                        else memory.content
+                                    ),
+                                }
+                            )
+                    except Exception as e:
+                        LOGGER.error(f"Failed to delete memory {memory.id}: {e}")
+
+            if deleted_count > 0:
+                await emitter.emit(
+                    f"Deleted {deleted_count} memory(s)", "complete", True
+                )
+                return json.dumps(
+                    {
+                        "success": True,
+                        "message": f"Successfully deleted {deleted_count} memory(s)",
+                        "deleted_count": deleted_count,
+                        "deleted_memories": deleted_memories,
+                        "source": "hybrid_dynamic_memory",
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                await emitter.emit("No memories deleted", "complete", True)
+                return json.dumps(
+                    {
+                        "success": False,
+                        "message": "No memories were deleted",
+                        "deleted_count": 0,
+                    }
+                )
+
+        except Exception as exc:
+            LOGGER.error(f"Error deleting memory: {exc}")
+            await emitter.emit("Memory deletion failed", "error", True)
+            return json.dumps({"error": str(exc)})
+
+    async def clear_embedding_cache(
+        self,
+        __user__: dict = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Clear embedding model cache to resolve performance issues.
+        Use when memory operations become slow.
+        Safe operation - does not affect stored memories, only clears model cache files.
+
+        :param __user__: User context
+        :param __event_emitter__: Event emitter for status updates
+        :return: JSON string with result
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if not __user__:
+            return json.dumps({"error": "User context required"})
+
+        await emitter.emit("Clearing embedding cache...", "processing", False)
+
+        try:
+            import gc
+            import shutil
+            import os
+
+            cleared_items = []
+
+            # Force Python garbage collection
+            gc.collect()
+            cleared_items.append("Python garbage collection")
+
+            # Try to clear PyTorch cache if available
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    cleared_items.append("PyTorch CUDA cache")
+            except ImportError:
+                pass  # PyTorch not available, that's okay
+
+            # Clear sentence-transformers cache directory if it exists
+            cache_paths = [
+                os.path.expanduser("~/.cache/torch/sentence_transformers/"),
+                os.path.expanduser(
+                    "~/.cache/huggingface/hub/models--sentence-transformers/"
+                ),
+            ]
+
+            for cache_path in cache_paths:
+                if os.path.exists(cache_path):
+                    try:
+                        # Get size before clearing for reporting
+                        size_mb = sum(
+                            os.path.getsize(os.path.join(dirpath, filename))
+                            for dirpath, dirnames, filenames in os.walk(cache_path)
+                            for filename in filenames
+                        ) / (1024 * 1024)
+
+                        shutil.rmtree(cache_path)
+                        cleared_items.append(f"Embedding cache ({size_mb:.1f} MB)")
+                        LOGGER.info(f"Cleared cache at {cache_path} ({size_mb:.1f} MB)")
+                    except Exception as e:
+                        LOGGER.warning(f"Could not clear {cache_path}: {e}")
+
+            # The model will reload fresh on next use
+            await emitter.emit("Cache cleared successfully", "complete", True)
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "message": "Embedding cache cleared. Performance should be improved.",
+                    "cleared": cleared_items,
+                    "note": "The embedding model will re-download on next use (~90MB)",
+                    "source": "hybrid_dynamic_memory",
+                }
+            )
+
+        except Exception as exc:
+            LOGGER.error(f"Error clearing cache: {exc}")
+            await emitter.emit("Cache clear failed", "error", True)
+            return json.dumps({"error": str(exc)})
